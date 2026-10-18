@@ -1,0 +1,8 @@
+## Interface: 16001
+## Title: Hitmarker (WoW Forever)
+## Notes: Plays a custom MP3 hitmarker cue for critical and other hits on your current target.
+## Author: OpenAI
+## Version: 1.7.0
+## SavedVariables: HitmarkerDB
+
+Hitmarker.lua
