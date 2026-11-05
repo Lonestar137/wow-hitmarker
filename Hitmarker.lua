@@ -86,6 +86,7 @@ local settingsCategory
 local optionsPanel
 local optionsContent
 local controls = {}
+local auraSnapshot
 
 local function BuildSoundList()
 	for _, preset in ipairs(SOUND_PRESETS) do
@@ -147,9 +148,93 @@ local function IsSecret(value)
 	return type(issecretvalue) == "function" and issecretvalue(value)
 end
 
+local function DescribeSecretAware(value)
+	if value == nil then
+		return "nil"
+	end
+	if IsSecret(value) then
+		return "<secret>"
+	end
+	return tostring(value)
+end
+
+local debugCombatEvents = false
+local debugCombatEventCount = 0
+
+local function GetInterfaceVersion()
+	if type(GetBuildInfo) ~= "function" then
+		return nil
+	end
+
+	local _, _, _, interfaceVersion = GetBuildInfo()
+	if type(interfaceVersion) == "number" then
+		return interfaceVersion
+	end
+	return nil
+end
+
+local function IsForeverClient()
+	local interfaceVersion = GetInterfaceVersion()
+	return interfaceVersion ~= nil and interfaceVersion >= 16000 and interfaceVersion < 17000
+end
+
+local function CanUseCombatLog()
+	-- Forever shares the modern UI API but restricts combat-log events. Classic
+	-- and TBC clients either expose the combat-log getter or use the legacy event
+	-- payload directly.
+	if IsForeverClient() then
+		return false
+	end
+
+	local interfaceVersion = GetInterfaceVersion()
+	-- 12.x (Midnight, and Forever's engine) removed CLEU for addons.
+	if interfaceVersion ~= nil and interfaceVersion >= 120000 then
+		return false
+	end
+
+	if type(CombatLogGetCurrentEventInfo) == "function" then
+		return true
+	end
+
+	if interfaceVersion ~= nil then
+		-- 16xxx is Forever's interface range, where CLEU is restricted.
+		return interfaceVersion < 16000 or interfaceVersion >= 20000
+	end
+
+	return false
+end
+
+local function CanAttackCurrentTarget()
+	local canAttackTarget = UnitCanAttack("player", "target")
+
+	-- Forever/Midnight can return a secret boolean here in combat. If the answer
+	-- cannot be read, keep the hit instead of silently dropping every combat cue.
+	if IsSecret(canAttackTarget) then
+		return true
+	end
+
+	return canAttackTarget and true or false
+end
+
 local function OnUnitCombat(unit, action, flag, amount)
 	-- WoW Forever blocks combat-log events. UNIT_COMBAT is the supported
 	-- replacement, but it omits the attacker and reports damage to the target.
+	if debugCombatEvents then
+		debugCombatEventCount = debugCombatEventCount + 1
+		if debugCombatEventCount <= 100 then
+			print(string.format(
+				"Hitmarker UNIT_COMBAT unit=%s action=%s flag=%s amount=%s",
+				DescribeSecretAware(unit),
+				DescribeSecretAware(action),
+				DescribeSecretAware(flag),
+				DescribeSecretAware(amount)
+			))
+		elseif debugCombatEventCount == 101 then
+			print("Hitmarker debug: 100 combat events shown. Type /hitmarker debug to restart.")
+			debugCombatEvents = false
+		end
+	end
+
 	if IsSecret(unit) or IsSecret(action) then
 		return
 	end
@@ -161,13 +246,19 @@ local function OnUnitCombat(unit, action, flag, amount)
 		return
 	end
 
-	local canAttackTarget = UnitCanAttack("player", "target")
-	if IsSecret(canAttackTarget) or not canAttackTarget then
+	if not CanAttackCurrentTarget() then
 		return
 	end
 
 	if action == "WOUND" then
-		if IsSecret(flag) or IsSecret(amount) or type(amount) ~= "number" or amount <= 0 then
+		-- The amount is often secret in combat on Forever/Midnight. It is only
+		-- used to ignore zero-damage hits, so skip that check when it is hidden
+		-- rather than dropping every damage cue.
+		if not IsSecret(amount) and type(amount) == "number" and amount <= 0 then
+			return
+		end
+
+		if IsSecret(flag) then
 			return
 		end
 
@@ -183,17 +274,107 @@ local function OnUnitCombat(unit, action, flag, amount)
 	end
 end
 
-local function OnUnitAura(unit, updateInfo)
-	if IsSecret(unit) or unit ~= "player" or IsSecret(updateInfo) or type(updateInfo) ~= "table" then
-		return
+local function MakeAuraKey(spellID, name, source, icon)
+	local identity = spellID
+	if IsSecret(identity) or identity == nil then
+		identity = name
 	end
-	if IsSecret(updateInfo.isFullUpdate) or updateInfo.isFullUpdate then
-		return
+	if IsSecret(identity) or identity == nil then
+		identity = icon
+	end
+	if IsSecret(identity) or identity == nil then
+		return nil
+	end
+
+	local sourceKey = ""
+	if not IsSecret(source) and type(source) == "string" then
+		sourceKey = source
+	end
+	return tostring(identity) .. ":" .. sourceKey
+end
+
+local function GetAuraSnapshot()
+	local snapshot = {}
+	local auraAPI = C_UnitAuras
+	local getAuraData = type(auraAPI) == "table" and auraAPI.GetAuraDataByIndex
+
+	for _, filter in ipairs({ "HELPFUL", "HARMFUL" }) do
+		for index = 1, 255 do
+			local key
+			if type(getAuraData) == "function" then
+				-- Aura access can be blocked while restricted on Forever/Midnight.
+				-- A failed read means "no readable auras" rather than a broken event.
+				local ok, auraData = pcall(getAuraData, "player", index, filter)
+				if not ok then
+					break
+				end
+				if auraData == nil then
+					break
+				end
+				if not IsSecret(auraData) and type(auraData) == "table" then
+					local auraInstanceID = auraData.auraInstanceID
+					if not IsSecret(auraInstanceID) and auraInstanceID ~= nil then
+						key = "instance:" .. tostring(auraInstanceID)
+					else
+						key = MakeAuraKey(auraData.spellId, auraData.name, auraData.sourceUnit, auraData.icon)
+					end
+				end
+			else
+				local getAura = UnitAura
+				if type(getAura) ~= "function" then
+					if filter == "HELPFUL" then
+						getAura = UnitBuff
+					else
+						getAura = UnitDebuff
+					end
+				end
+				if type(getAura) ~= "function" then
+					break
+				end
+
+				local name, icon, _, _, _, _, source, _, _, spellID = getAura("player", index, filter)
+				if name == nil then
+					break
+				end
+				key = MakeAuraKey(spellID, name, source, icon)
+			end
+
+			if key then
+				snapshot[filter .. ":" .. key] = true
+			end
+		end
+	end
+
+	return snapshot
+end
+
+local function PlayAuraEffects(receivedBuff, receivedDebuff)
+	-- Play at most once per update batch to avoid a burst when several auras land together.
+	if receivedBuff then
+		PlayEffect("buff")
+	end
+	if receivedDebuff then
+		PlayEffect("debuff")
+	end
+end
+
+local function OnAuraDelta(updateInfo)
+	if IsSecret(updateInfo) or type(updateInfo) ~= "table" then
+		return false
+	end
+
+	local isFullUpdate = updateInfo.isFullUpdate
+	if IsSecret(isFullUpdate) then
+		return true
+	end
+	if isFullUpdate then
+		auraSnapshot = GetAuraSnapshot()
+		return true
 	end
 
 	local addedAuras = updateInfo.addedAuras
 	if IsSecret(addedAuras) or type(addedAuras) ~= "table" then
-		return
+		return true
 	end
 
 	local receivedBuff = false
@@ -212,12 +393,114 @@ local function OnUnitAura(unit, updateInfo)
 		end
 	end
 
-	-- Play at most once per update batch to avoid a burst when several auras land together.
-	if receivedBuff then
-		PlayEffect("buff")
+	PlayAuraEffects(receivedBuff, receivedDebuff)
+	return true
+end
+
+local function OnLegacyAuraUpdate()
+	local currentSnapshot = GetAuraSnapshot()
+	if not auraSnapshot then
+		auraSnapshot = currentSnapshot
+		return
 	end
-	if receivedDebuff then
-		PlayEffect("debuff")
+
+	local receivedBuff = false
+	local receivedDebuff = false
+	for key in pairs(currentSnapshot) do
+		if not auraSnapshot[key] then
+			if string.sub(key, 1, 8) == "HELPFUL:" then
+				receivedBuff = true
+			elseif string.sub(key, 1, 8) == "HARMFUL:" then
+				receivedDebuff = true
+			end
+		end
+	end
+	auraSnapshot = currentSnapshot
+	PlayAuraEffects(receivedBuff, receivedDebuff)
+end
+
+local function OnUnitAura(unit, updateInfo)
+	if IsSecret(unit) or unit ~= "player" or IsSecret(updateInfo) then
+		return
+	end
+
+	if OnAuraDelta(updateInfo) then
+		return
+	end
+	OnLegacyAuraUpdate()
+end
+
+local function OnCombatLog(...)
+	local eventInfo = { ... }
+	if type(CombatLogGetCurrentEventInfo) == "function" then
+		eventInfo = { CombatLogGetCurrentEventInfo() }
+	end
+
+	local subevent = eventInfo[2]
+	local destGUID = eventInfo[8]
+	if IsSecret(subevent) or IsSecret(destGUID) then
+		return
+	end
+
+	local playerGUID = UnitGUID("player")
+	if not IsSecret(playerGUID) and destGUID == playerGUID then
+		local missType
+		if subevent == "SWING_MISSED" then
+			missType = eventInfo[12]
+		elseif subevent == "SPELL_MISSED" or subevent == "RANGE_MISSED" then
+			missType = eventInfo[15]
+		end
+		if not IsSecret(missType) and missType == "PARRY" then
+			PlayEffect("parry")
+			return
+		end
+	end
+
+	local targetGUID = UnitGUID("target")
+	if IsSecret(targetGUID) or destGUID ~= targetGUID or not CanAttackCurrentTarget() then
+		return
+	end
+
+	local amount, blocked, critical
+	if subevent == "SWING_DAMAGE" then
+		amount = eventInfo[12]
+		blocked = eventInfo[16]
+		critical = eventInfo[18]
+	elseif subevent == "RANGE_DAMAGE" or subevent == "SPELL_DAMAGE" or subevent == "SPELL_PERIODIC_DAMAGE" then
+		amount = eventInfo[15]
+		blocked = eventInfo[19]
+		critical = eventInfo[21]
+	elseif subevent == "SWING_MISSED" then
+		local missType = eventInfo[12]
+		if not IsSecret(missType) then
+			if missType == "BLOCK" then
+				PlayEffect("blocked")
+			elseif missType == "DODGE" or missType == "MISS" then
+				PlayEffect("dodgeMiss")
+			end
+		end
+		return
+	elseif subevent == "SPELL_MISSED" or subevent == "RANGE_MISSED" then
+		local missType = eventInfo[15]
+		if not IsSecret(missType) then
+			if missType == "BLOCK" then
+				PlayEffect("blocked")
+			elseif missType == "DODGE" or missType == "MISS" then
+				PlayEffect("dodgeMiss")
+			end
+		end
+		return
+	else
+		return
+	end
+
+	if IsSecret(amount) or type(amount) ~= "number" or amount <= 0 then
+		return
+	end
+	if not IsSecret(blocked) and type(blocked) == "number" and blocked > 0 then
+		PlayEffect("blocked")
+	else
+		PlayEffect(not IsSecret(critical) and critical and "critical" or "normal")
 	end
 end
 
@@ -392,20 +675,45 @@ end
 
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
-eventFrame:RegisterEvent("UNIT_COMBAT")
 eventFrame:RegisterEvent("UNIT_AURA")
 eventFrame:SetScript("OnEvent", function(_, event, ...)
 	local loadedAddon = ...
 	if event == "ADDON_LOADED" and loadedAddon == ADDON_NAME then
 		BuildSoundList()
 		InitializeDatabase()
+		auraSnapshot = GetAuraSnapshot()
 		CreateOptionsPanel()
 	elseif event == "UNIT_COMBAT" then
 		OnUnitCombat(...)
 	elseif event == "UNIT_AURA" then
 		OnUnitAura(...)
+	elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+		OnCombatLog(...)
 	end
 end)
 
+if CanUseCombatLog() then
+	local registered = pcall(eventFrame.RegisterEvent, eventFrame, "COMBAT_LOG_EVENT_UNFILTERED")
+	if not registered then
+		eventFrame:RegisterEvent("UNIT_COMBAT")
+	end
+else
+	eventFrame:RegisterEvent("UNIT_COMBAT")
+end
+
 SLASH_HITMARKER1 = "/hitmarker"
-SlashCmdList.HITMARKER = OpenOptions
+SlashCmdList.HITMARKER = function(message)
+	local command = ""
+	if type(message) == "string" then
+		command = string.lower(string.match(message, "^%s*(.-)%s*$") or "")
+	end
+
+	if command == "debug" then
+		debugCombatEvents = not debugCombatEvents
+		debugCombatEventCount = 0
+		print("Hitmarker combat debug " .. (debugCombatEvents and "on" or "off") .. ".")
+		return
+	end
+
+	OpenOptions()
+end
